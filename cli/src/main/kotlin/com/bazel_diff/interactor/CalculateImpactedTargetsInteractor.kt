@@ -1,6 +1,7 @@
 package com.bazel_diff.interactor
 
 import com.bazel_diff.bazel.BazelQueryService
+import com.bazel_diff.bazel.Module
 import com.bazel_diff.bazel.ModuleGraphParser
 import com.bazel_diff.hash.TargetHash
 import com.bazel_diff.log.Logger
@@ -53,7 +54,7 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
 
     val impactedTargets = if (changedModules.isNotEmpty()) {
       logger.i { "Module changes detected - querying for targets that depend on changed modules" }
-      queryTargetsDependingOnModules(changedModules, to)
+      queryTargetsDependingOnModules(changedModules, from, to)
     } else {
       computeSimpleImpactedTargets(from, to)
     }
@@ -106,7 +107,7 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
 
     val impactedTargets = if (changedModules.isNotEmpty()) {
       logger.i { "Module changes detected - querying for targets that depend on changed modules" }
-      val moduleImpactedTargets = queryTargetsDependingOnModules(changedModules, to)
+      val moduleImpactedTargets = queryTargetsDependingOnModules(changedModules, from, to)
       // Mark module-impacted targets with distance 0, then compute distances from there
       val moduleImpactedHashes = from.filterKeys { !moduleImpactedTargets.contains(it) }
       computeAllDistances(moduleImpactedHashes, to, depEdges)
@@ -239,56 +240,75 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
   }
 
   /**
-   * Detects module changes by comparing module graphs and returns changed module keys.
+   * Detects module changes by comparing module graphs and returns the changed Modules.
    *
-   * This method:
-   * 1. Parses the from and to module graphs
-   * 2. Identifies which modules changed (added, removed, or version changed)
-   * 3. Logs the changes for visibility
-   * 4. Returns the set of changed module keys
+   * Resolves each changed key against the "to" graph first (the state we will query
+   * against), falling back to the "from" graph for modules that were removed.
    *
-   * @param fromModuleGraphJson JSON from `bazel mod graph --output=json` for starting revision
-   * @param toModuleGraphJson JSON from `bazel mod graph --output=json` for final revision
-   * @return Set of changed module keys, empty if no changes
+   * @param fromModuleGraphJson JSON from `bazel mod graph --output=json` for the starting revision
+   * @param toModuleGraphJson JSON from `bazel mod graph --output=json` for the final revision
+   * @return Set of changed Modules, empty if no changes
    */
   private fun detectChangedModules(
       fromModuleGraphJson: String?,
       toModuleGraphJson: String?
-  ): Set<String> {
-    // If either module graph is missing, assume no changes
+  ): Set<Module> {
     if (fromModuleGraphJson == null || toModuleGraphJson == null) {
       return emptySet()
     }
 
-    // Parse module graphs
     val fromGraph = moduleGraphParser.parseModuleGraph(fromModuleGraphJson)
     val toGraph = moduleGraphParser.parseModuleGraph(toModuleGraphJson)
+    val changedKeys = moduleGraphParser.findChangedModules(fromGraph, toGraph)
 
-    // Find changed modules
-    val changedModules = moduleGraphParser.findChangedModules(fromGraph, toGraph)
-
-    if (changedModules.isEmpty()) {
+    if (changedKeys.isEmpty()) {
       logger.i { "No module changes detected" }
-    } else {
-      logger.i { "Detected ${changedModules.size} module changes: ${changedModules.joinToString(", ")}" }
+      return emptySet()
     }
 
+    val changedModules = changedKeys.mapNotNull { key -> toGraph[key] ?: fromGraph[key] }.toSet()
+    logger.i { "Detected ${changedModules.size} module changes: ${changedModules.joinToString(", ") { it.key }}" }
     return changedModules
   }
 
   /**
    * Queries Bazel to find all workspace targets that depend on any changed module.
    *
-   * Maps every changed module to its matching bzlmod canonical repos, then issues a
-   * single `rdeps(//..., @@a//... + @@b//... + ...)` query. Bazel executes the union
-   * in one analysis pass, avoiding per-repo subprocess fan-out.
+   * For each changed module M we compute the set of canonical repos in `allTargets`
+   * that belong to M, then issue a single unioned
+   * `rdeps(//..., @@<repo1>//... + @@<repo2>//... + ...)` query. Bazel executes
+   * the union in one analysis pass, avoiding per-repo subprocess fan-out.
    *
-   * @param changedModuleKeys Set of changed module keys (e.g., "abseil-cpp@20240722.0")
-   * @param allTargets Map of all targets from the final revision
+   * Repo ownership is decided by two ordered predicates:
+   *
+   * 1. Tier A — root repo mapping. If `bazel mod dump_repo_mapping ""` maps
+   *    `M.apparentName` to canonical C, any repo R with R == C or R starts with
+   *    "C+" / "C~" belongs to M. Covers extension-created children (`C++ext+repo`,
+   *    `C~~ext~repo`) whose parent canonical lives in M.
+   * 2. Tier B — name-prefix fallback. R belongs to M if R starts with
+   *    "{M.name}+" or "{M.name}~". Extension-created forms (`name++ext+repo`,
+   *    `name~~ext~repo`) are already covered by these prefixes. Handles
+   *    transitive modules absent from root's mapping and the case where
+   *    `discoverRepoMapping` failed.
+   *
+   * Modules that match nothing (Tier C) are logged and skipped — a module with no
+   * materialised repos in `allTargets.keys` cannot impact any hashed target, and
+   * `computeSimpleImpactedTargets` still runs below to catch direct source changes.
+   *
+   * The key invariant vs. the previous implementation: we match on the parsed
+   * canonical repo name (`label.substring(2).substringBefore("//")`), not on a
+   * `contains` substring of the full label, so a module named "cpp" no longer
+   * matches canonical `abseil-cpp+`.
+   *
+   * @param changedModules Modules identified as changed between the two graphs
+   * @param from Starting-revision target hashes; used only to pick up labels whose
+   *     content changed independently of any module bump
+   * @param allTargets Final-revision target hashes (the set we can query against)
    * @return Set of target labels that are impacted by module changes
    */
   private fun queryTargetsDependingOnModules(
-      changedModuleKeys: Set<String>,
+      changedModules: Set<Module>,
+      from: Map<String, TargetHash>,
       allTargets: Map<String, TargetHash>
   ): Set<String> {
     val queryService: BazelQueryService? = try {
@@ -302,48 +322,108 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
       return allTargets.keys
     }
 
-    // Map every changed module to its matching bzlmod canonical repos. A single module
-    // name can match multiple canonical repos (e.g. rules_jvm_external matches
-    // rules_jvm_external~~maven~maven, rules_jvm_external~~toolchains~...). Log per
-    // module so an operator can attribute a pathologically large impacted set back to
-    // a specific module bump.
-    val moduleRepos = mutableSetOf<String>()
-    for (moduleKey in changedModuleKeys) {
-      val moduleName = moduleKey.substringBefore("@")
-      val matched = allTargets.keys
-          .filter { it.startsWith("@@") && it.contains(moduleName) }
-          .map { it.substring(2).substringBefore("//") }
-      if (matched.isEmpty()) {
-        logger.w { "No external repository matched module $moduleKey" }
-      } else {
-        logger.i { "Module $moduleKey matched ${matched.size} repos: ${matched.joinToString(", ")}" }
-        moduleRepos.addAll(matched)
+    val repoMapping: Map<String, String> =
+        try {
+          runBlocking { queryService.discoverRepoMapping() }
+        } catch (e: Exception) {
+          logger.w { "discoverRepoMapping failed, falling back to module-name matching: ${e.message}" }
+          emptyMap()
+        }
+    // Log size so operators can distinguish "Tier A had nothing to match
+    // against" from "Tier A matched but the module wasn't in root mapping".
+    // `discoverRepoMapping` returns an empty map on subprocess exit != 0
+    // without throwing, so we cannot rely on the catch block above to
+    // surface that case.
+    logger.i { "Discovered ${repoMapping.size} root repo mapping entries" }
+
+    // Parse `allTargets` into the set of canonical repo names once, instead of
+    // rescanning every label per changed module.
+    val canonicalRepos: Set<String> = allTargets.keys.asSequence()
+        .filter { it.startsWith("@@") }
+        .map { it.substring(2).substringBefore("//") }
+        .filter { it.isNotEmpty() }
+        .toSet()
+
+    // Collect the canonical repos to query once — multiple "changed modules"
+    // often collapse to the same canonical name (e.g. `findChangedModules`
+    // reports both `foo@1.0` removed and `foo@2.0` added, or two modules have
+    // overlapping extension-created children). Running `rdeps` per distinct
+    // canonical name — not per module iteration — avoids the redundant work.
+    val reposToQuery = mutableSetOf<String>()
+    for (module in changedModules) {
+      logger.i { "Resolving repos for changed module: ${module.name} (key: ${module.key})" }
+      val moduleRepos = reposOwnedBy(module, canonicalRepos, repoMapping)
+      if (moduleRepos.isEmpty()) {
+        logger.w { "No external repository found for module ${module.name}" }
+        continue
+      }
+      logger.i { "Found ${moduleRepos.size} repositories for module ${module.name}: ${moduleRepos.joinToString(", ")}" }
+      reposToQuery.addAll(moduleRepos)
+    }
+
+    val impactedTargets = mutableSetOf<String>()
+    if (reposToQuery.isNotEmpty()) {
+      try {
+        // Single unioned rdeps query: bazel executes the union in one analysis pass,
+        // collapsing N × (startup + analysis) into 1 × (startup + N × analysis).
+        val queryExpression = "rdeps(//..., ${reposToQuery.joinToString(" + ") { "@@$it//..." }})"
+        logger.i { "Executing unioned rdeps query across ${reposToQuery.size} repositories" }
+        val rdeps = runBlocking { queryService.query(queryExpression, useCquery = false) }
+        val rdepLabels = rdeps.map { it.name }.filter { !it.startsWith("@@") }
+        logger.i { "Found ${rdepLabels.size} workspace targets depending on changed modules" }
+        impactedTargets.addAll(rdepLabels)
+      } catch (e: Exception) {
+        logger.e(e) { "Unioned rdeps query failed - conservatively marking all workspace targets impacted" }
+        impactedTargets.addAll(allTargets.keys.filter { !it.startsWith("@@") })
       }
     }
 
-    if (moduleRepos.isEmpty()) {
-      logger.i { "No external repositories matched any changed module" }
-      return computeSimpleImpactedTargets(emptyMap(), allTargets)
-    }
-
-    logger.i { "Querying rdeps for ${moduleRepos.size} repositories across ${changedModuleKeys.size} changed modules" }
-
-    val impactedTargets = mutableSetOf<String>()
-    try {
-      // Single unioned rdeps query: bazel executes the union in one analysis pass.
-      val queryExpression = "rdeps(//..., ${moduleRepos.joinToString(" + ") { "@@$it//..." }})"
-      val rdeps = runBlocking { queryService.query(queryExpression, useCquery = false) }
-      val rdepLabels = rdeps.map { it.name }.filter { !it.startsWith("@@") }
-      logger.i { "Found ${rdepLabels.size} workspace targets depending on changed modules" }
-      impactedTargets.addAll(rdepLabels)
-    } catch (e: Exception) {
-      logger.e(e) { "Unioned rdeps query failed - conservatively marking all workspace targets impacted" }
-      impactedTargets.addAll(allTargets.keys.filter { !it.startsWith("@@") })
-    }
-
-    impactedTargets.addAll(computeSimpleImpactedTargets(emptyMap(), allTargets))
+    // Union with hash-diff results so we still surface labels whose content changed
+    // independently of any module version bump (e.g. a source file in `//app:app`
+    // edited in the same commit as a MODULE.bazel update). The earlier
+    // `computeSimpleImpactedTargets(emptyMap(), allTargets)` form returned every
+    // key in `allTargets`, which silently defeated the rdeps filtering above.
+    val directlyChanged = computeSimpleImpactedTargets(from, allTargets)
+    impactedTargets.addAll(directlyChanged)
 
     logger.i { "Total targets impacted by module changes: ${impactedTargets.size}" }
     return impactedTargets
+  }
+
+  /**
+   * Canonical repos in `canonicalRepos` that belong to `module`, using Tier A
+   * (root repo mapping) plus Tier B (name-prefix fallback). See
+   * [queryTargetsDependingOnModules] for the full contract.
+   *
+   * @param module Changed module whose owned repos we want to resolve
+   * @param canonicalRepos Set of canonical repo names parsed from `allTargets.keys`
+   * @param repoMapping Root module's apparent→canonical repo mapping (may be empty)
+   * @return Canonical repos belonging to `module`, or empty if none matched (Tier C)
+   */
+  private fun reposOwnedBy(
+      module: Module,
+      canonicalRepos: Set<String>,
+      repoMapping: Map<String, String>
+  ): Set<String> {
+    val prefixes = mutableListOf<String>()
+    val exactMatches = mutableSetOf<String>()
+
+    val mappedCanonical = repoMapping[module.apparentName]
+    if (!mappedCanonical.isNullOrEmpty()) {
+      exactMatches.add(mappedCanonical)
+      prefixes.add("$mappedCanonical+")
+      prefixes.add("$mappedCanonical~")
+    }
+
+    // Tier B prefixes always apply — they cover transitive modules that root's
+    // `dump_repo_mapping` does not include, and also act as the sole source when
+    // `discoverRepoMapping` returned empty. `++`/`~~` are subsumed by `+`/`~`
+    // (extension-created repos start with `name+` or `name~` by definition).
+    prefixes.add("${module.name}+")
+    prefixes.add("${module.name}~")
+
+    return canonicalRepos.filter { repo ->
+      repo in exactMatches || prefixes.any { repo.startsWith(it) }
+    }.toSet()
   }
 }

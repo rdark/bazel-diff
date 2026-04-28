@@ -653,6 +653,7 @@ class CalculateImpactedTargetsInteractorTest : KoinTest {
     // canonical repos should produce a single unioned rdeps query, not two.
     val captured = mutableListOf<String>()
     val fakeQueryService: BazelQueryService = mock {
+      onBlocking { discoverRepoMapping() } doAnswer { emptyMap<String, String>() }
       onBlocking { query(any(), any()) } doAnswer {
         captured.add(it.getArgument(0))
         emptyList<BazelTarget>()
