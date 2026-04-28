@@ -373,8 +373,18 @@ class CalculateImpactedTargetsInteractor : KoinComponent {
         logger.i { "Found ${rdepLabels.size} workspace targets depending on changed modules" }
         impactedTargets.addAll(rdepLabels)
       } catch (e: Exception) {
-        logger.e(e) { "Unioned rdeps query failed - conservatively marking all workspace targets impacted" }
-        impactedTargets.addAll(allTargets.keys.filter { !it.startsWith("@@") })
+        logger.e(e) { "Unioned rdeps query failed - conservatively marking all targets impacted" }
+        // Emit the buildable workspace subset when it exists; otherwise
+        // (bzlmod-only shape) fall through to every hashed label so the
+        // downstream `excludeExternalTargets` strip does not reduce the
+        // fallback to empty.
+        val buildableWorkspaceTargets = allTargets.keys.filter {
+          !it.startsWith("@@") && !it.startsWith("//external:")
+        }
+        impactedTargets.addAll(
+            if (buildableWorkspaceTargets.isEmpty()) allTargets.keys
+            else buildableWorkspaceTargets
+        )
       }
     }
 
